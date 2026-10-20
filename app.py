@@ -26,7 +26,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from plotly.subplots import make_subplots
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -49,9 +48,6 @@ REQUEST_TIMEOUT = 45
 # A month-over-month move in ln S(t) larger than this is flagged as a possible
 # currency redenomination or series break (ln(1.5) is about 0.405).
 BREAK_LOG_THRESHOLD = float(np.log(1.5))
-
-# Minimum observations to estimate the AR(1) half-life.
-MIN_OBS_HALF_LIFE = 24
 
 OTHER_LABEL = "Other (type an IMF ISO3 code)"
 
@@ -392,25 +388,6 @@ def compute_sample(df: pd.DataFrame, start: pd.Period, end: pd.Period) -> tuple[
     return s, rer_star
 
 
-def half_life(rer: pd.Series) -> dict | None:
-    """AR(1) on ln RER using consecutive valid months: q_t = a + rho * q_{t-1} + e_t."""
-    q = np.log(rer.astype("float64"))
-    lag = q.shift(1)
-    mask = q.notna() & lag.notna()
-    n = int(mask.sum())
-    if n < MIN_OBS_HALF_LIFE:
-        return None
-    X = np.column_stack([np.ones(n), lag[mask].to_numpy()])
-    y = q[mask].to_numpy()
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    rho = float(beta[1])
-    if 0 < rho < 1:
-        hl_months = float(np.log(0.5) / np.log(rho))
-    else:
-        hl_months = float("inf")
-    return {"rho": rho, "months": hl_months, "years": hl_months / 12.0, "n": n}
-
-
 def fmt_num(x: float) -> str:
     if x is None or not np.isfinite(x):
         return "n/a"
@@ -430,76 +407,99 @@ def _dates(s: pd.DataFrame):
     return s.index.to_timestamp()
 
 
-def add_shading(fig: go.Figure, s: pd.DataFrame, secondary: bool | None = None) -> None:
-    x = _dates(s)
-    idx = s["real_index"]
-    above = idx.where(idx.isna(), np.maximum(idx, 100.0))
-    below = idx.where(idx.isna(), np.minimum(idx, 100.0))
-    base = idx.where(idx.isna(), 100.0)
-    kw = {} if secondary is None else {"secondary_y": secondary}
-    for series, color, name in ((above, FILL_OVER, "Overvalued"), (below, FILL_UNDER, "Undervalued")):
-        fig.add_trace(go.Scatter(x=x, y=base, mode="lines", line=dict(width=0),
-                                 hoverinfo="skip", showlegend=False), **kw)
-        fig.add_trace(go.Scatter(x=x, y=series, mode="lines", line=dict(width=0),
-                                 fill="tonexty", fillcolor=color, name=name, hoverinfo="skip"), **kw)
+def valuation_polygons(s: pd.DataFrame) -> tuple[list, list, list, list]:
+    """Closed polygons between the Real Index and 100, split into the parts above
+    (overvalued) and below (undervalued). Crossings of 100 are interpolated so the
+    shading switches color exactly where the line crosses the benchmark. Each run of
+    consecutive valid months is its own polygon, so data gaps are never bridged."""
+    times = list(_dates(s))
+    vals = s["real_index"].to_numpy(dtype="float64")
+
+    segments, current = [], []
+    for t, v in zip(times, vals):
+        if np.isfinite(v):
+            current.append((t, v))
+        elif current:
+            segments.append(current)
+            current = []
+    if current:
+        segments.append(current)
+
+    ax, ay, bx, by = [], [], [], []
+    for seg in segments:
+        # Insert interpolated crossing points, then cut the segment into runs that
+        # stay on one side of 100. Each run becomes one simple closed polygon.
+        runs, run = [], [seg[0]]
+        for (t0, v0), (t1, v1) in zip(seg, seg[1:]):
+            if (v0 - 100.0) * (v1 - 100.0) < 0:
+                cross = ((t0 + (t1 - t0) * ((100.0 - v0) / (v1 - v0))).floor("min"), 100.0)
+                run.append(cross)
+                runs.append(run)
+                run = [cross]
+            run.append((t1, v1))
+            if v1 == 100.0:  # touching the benchmark exactly also ends a run
+                runs.append(run)
+                run = [(t1, v1)]
+        runs.append(run)
+        for run in runs:
+            dev = max((v - 100.0 for _, v in run), key=abs)
+            if len(run) < 2 or dev == 0:
+                continue
+            xs = [p[0] for p in run] + [run[-1][0], run[0][0], run[0][0], None]
+            ys = [p[1] for p in run] + [100.0, 100.0, run[0][1], None]
+            if dev > 0:
+                ax += xs
+                ay += ys
+            else:
+                bx += xs
+                by += ys
+    return ax, ay, bx, by
 
 
-def real_trace(s: pd.DataFrame) -> go.Scatter:
-    return go.Scatter(
-        x=_dates(s), y=s["real_index"], mode="lines", name="Real Index (RER* = 100)",
+BASE_LAYOUT = dict(
+    height=430, hovermode="x unified", template="plotly_white",
+    margin=dict(l=10, r=10, t=50, b=10),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+)
+
+
+def real_chart(s: pd.DataFrame, cur1: str, cur2: str) -> go.Figure:
+    fig = go.Figure()
+    ax, ay, bx, by = valuation_polygons(s)
+    fig.add_trace(go.Scatter(x=ax, y=ay, mode="lines", line=dict(width=0), fill="toself",
+                             fillcolor=FILL_OVER, name=f"{cur1} overvalued", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=bx, y=by, mode="lines", line=dict(width=0), fill="toself",
+                             fillcolor=FILL_UNDER, name=f"{cur1} undervalued", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(
+        x=_dates(s), y=s["real_index"], mode="lines", name="Real Index",
         line=dict(color=COLOR_INDEX, width=2.2),
-        hovertemplate="%{x|%b %Y}<br>Real Index: %{y:.1f}<extra></extra>",
-    )
+        hovertemplate="Real Index: %{y:.1f}<extra></extra>",
+    ))
+    fig.add_hline(y=100, line=dict(color="#333", width=1, dash="dot"))
+    fig.update_layout(title=dict(text=f"Real exchange rate index, {cur1} vs {cur2} (RER* = 100)",
+                                 x=0, y=0.98, font=dict(size=16)), **BASE_LAYOUT)
+    fig.update_yaxes(title_text="Real Index")
+    return fig
 
 
-def nominal_traces(s: pd.DataFrame, cur1: str, cur2: str, show_ppp: bool) -> list[go.Scatter]:
+def nominal_chart(s: pd.DataFrame, cur1: str, cur2: str, log_scale: bool,
+                  show_ppp: bool) -> go.Figure:
     unit = f"{cur2} per {cur1}"
-    traces = [go.Scatter(
-        x=_dates(s), y=s["S"], mode="lines", name=f"Nominal S ({unit})",
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=_dates(s), y=s["S"], mode="lines", name="Nominal S",
         line=dict(color=COLOR_NOMINAL, width=2),
-        hovertemplate="%{x|%b %Y}<br>S: %{y:,.6g} " + unit + "<extra></extra>",
-    )]
+        hovertemplate="S: %{y:,.6g} " + unit + "<extra></extra>",
+    ))
     if show_ppp:
-        traces.append(go.Scatter(
+        fig.add_trace(go.Scatter(
             x=_dates(s), y=s["S_PPP"], mode="lines", name="PPP-implied S at RER*",
             line=dict(color=COLOR_PPP, width=1.6, dash="dash"),
-            hovertemplate="%{x|%b %Y}<br>PPP-implied S: %{y:,.6g} " + unit + "<extra></extra>",
+            hovertemplate="PPP-implied S: %{y:,.6g} " + unit + "<extra></extra>",
         ))
-    return traces
-
-
-def make_chart(s: pd.DataFrame, view: str, cur1: str, cur2: str, log_nominal: bool,
-               shade: bool, show_ppp: bool) -> go.Figure:
-    unit = f"{cur2} per 1 {cur1}"
-    layout = dict(
-        height=560, hovermode="x unified", template="plotly_white",
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    )
-    if view == "Real":
-        fig = go.Figure()
-        if shade:
-            add_shading(fig, s)
-        fig.add_trace(real_trace(s))
-        fig.add_hline(y=100, line=dict(color="#333", width=1, dash="dot"))
-        fig.update_yaxes(title_text="Real Index (sample average = 100)")
-    elif view == "Nominal":
-        fig = go.Figure(nominal_traces(s, cur1, cur2, show_ppp))
-        fig.update_yaxes(title_text=f"S(t): {unit}", type="log" if log_nominal else "linear")
-    else:
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        if shade:
-            add_shading(fig, s, secondary=False)
-        fig.add_trace(real_trace(s), secondary_y=False)
-        for t in nominal_traces(s, cur1, cur2, show_ppp):
-            fig.add_trace(t, secondary_y=True)
-        fig.add_hline(y=100, line=dict(color="#333", width=1, dash="dot"), secondary_y=False)
-        fig.update_yaxes(title_text="Real Index (sample average = 100)",
-                         title_font=dict(color=COLOR_INDEX), secondary_y=False)
-        fig.update_yaxes(title_text=f"S(t): {unit}", title_font=dict(color=COLOR_NOMINAL),
-                         type="log" if log_nominal else "linear", showgrid=False, secondary_y=True)
-    fig.update_layout(**layout)
-    fig.update_xaxes(title_text=None)
+    fig.update_layout(title=dict(text=f"Nominal exchange rate: {cur2} per 1 {cur1}",
+                                 x=0, y=0.98, font=dict(size=16)), **BASE_LAYOUT)
+    fig.update_yaxes(title_text=unit, type="log" if log_scale else "linear")
     return fig
 
 
@@ -557,15 +557,14 @@ def sidebar() -> dict:
 
     sb.header("Chart")
     view = sb.radio("Series to plot", ["Real", "Nominal", "Both"], index=2, horizontal=True)
-    log_nominal = sb.checkbox("Log scale for nominal S", value=False,
-                              help="Recommended for high-inflation currencies, where S spans "
+    log_nominal = sb.checkbox("Log scale for nominal chart", value=False,
+                              help="Useful for high-inflation currencies, where S spans "
                                    "several orders of magnitude.")
-    shade = sb.checkbox("Shade over/undervaluation", value=True)
-    show_ppp = sb.checkbox("Show PPP-implied exchange rate", value=True)
+    show_ppp = sb.checkbox("Add PPP-implied rate to nominal chart", value=False)
     sb.caption("Data: IMF SDMX 3.0 API (CPI and ER dataflows). Cached for 24 hours.")
     if sb.button("Clear cached IMF data", width="stretch"):
         st.cache_data.clear()
-    return {"view": view, "log_nominal": log_nominal, "shade": shade, "show_ppp": show_ppp}
+    return {"view": view, "log_nominal": log_nominal, "show_ppp": show_ppp}
 
 
 def main() -> None:
@@ -642,36 +641,27 @@ def main() -> None:
     last_month = sample[sample["valid"]].index[-1]
     dev = float(last["deviation_pct"])
     direction = "overvalued" if dev > 0 else "undervalued"
-    hl = half_life(sample["RER"])
 
     st.markdown(
         f"**In {last_month.strftime('%b %Y')}, the {cur1} is {abs(dev):.1f}% {direction} against "
         f"the {cur2}** relative to its {start.strftime('%b %Y')} to {end.strftime('%b %Y')} average "
         f"real exchange rate (Real Index = {last['real_index']:.1f})."
     )
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3 = st.columns(3)
     m1.metric("Real Index (latest)", f"{last['real_index']:.1f}", f"{dev:+.1f}% vs RER*",
               delta_color="off")
     m2.metric(f"Nominal S ({cur2} per {cur1})", fmt_num(float(last["S"])))
-    m3.metric("PPP-implied S at RER*", fmt_num(float(last["S_PPP"])))
-    m4.metric("RER*", fmt_num(rer_star))
-    if hl is None:
-        m5.metric("Half-life of deviations", "n/a", f"needs {MIN_OBS_HALF_LIFE}+ months",
-                  delta_color="off")
-    elif np.isinf(hl["months"]):
-        m5.metric("Half-life of deviations", "no reversion", f"rho = {hl['rho']:.3f}",
-                  delta_color="off")
-    else:
-        m5.metric("Half-life of deviations", f"{hl['years']:.1f} years",
-                  f"rho = {hl['rho']:.3f}, n = {hl['n']}", delta_color="off")
+    m3.metric("RER* (sample average RER)", fmt_num(rer_star))
 
-    # --- Chart ---------------------------------------------------------------
-    fig = make_chart(sample, opts["view"], cur1, cur2, opts["log_nominal"], opts["shade"],
-                     opts["show_ppp"])
-    st.plotly_chart(fig, width="stretch")
-    st.caption(f"Valid months in sample: {n_valid} of {len(sample)}. "
-               "Index above 100: Country 1's currency is real appreciated (overvalued) relative "
-               "to the sample average. Below 100: undervalued.")
+    # --- Charts --------------------------------------------------------------
+    if opts["view"] in ("Real", "Both"):
+        st.plotly_chart(real_chart(sample, cur1, cur2), width="stretch")
+        st.caption("Above 100 (red): Country 1's currency is overvalued in real terms relative to "
+                   "the sample average. Below 100 (green): undervalued.")
+    if opts["view"] in ("Nominal", "Both"):
+        st.plotly_chart(nominal_chart(sample, cur1, cur2, opts["log_nominal"], opts["show_ppp"]),
+                        width="stretch")
+    st.caption(f"Valid months in sample: {n_valid} of {len(sample)}.")
 
     # --- Data quality warnings -------------------------------------------------
     breaks = sample.index[sample["possible_break"].fillna(False).astype(bool)]
@@ -762,9 +752,6 @@ years cancel out in this ratio, the index does not depend on how each CPI is reb
 
 **PPP-implied rate.** S_PPP(t) = RER* × P2(t) / P1(t): the nominal rate that would put the RER
 exactly at its sample average. Actual S above S_PPP means the {cur1} is overvalued.
-
-**Half-life.** OLS estimate of ln RER(t) = a + ρ ln RER(t−1) + e(t) on consecutive valid months.
-Half-life = ln(0.5) / ln(ρ) months, reported in years. The PPP literature typically finds 3 to 5 years.
 
 **Caveat.** The benchmark is relative PPP against the chosen sample average, so conclusions
 depend on the window. Structural shifts (e.g. Balassa-Samuelson productivity effects) can move the
